@@ -3,10 +3,15 @@ package com.example.bluetoothproj
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -72,6 +77,10 @@ class MainActivity : ComponentActivity() {
 
     // We keep a reference to the ScanCallback so we can stop scanning later
     private var scanCallback: ScanCallback? = null
+
+    // Classic discovery support (prototype-only, no RSSI)
+    private var classicFoundReceiver: BroadcastReceiver? = null
+    private var isClassicReceiverRegistered: Boolean = false
 
     // Remember if the user pressed "Start Scan" so we can begin scanning
     // after permissions are granted.
@@ -159,6 +168,14 @@ class MainActivity : ComponentActivity() {
         // Clear old results when starting a new scan
         scannedDevices.clear()
 
+        // Also show already-paired Classic (BR/EDR) devices in the same list.
+        // They won't have RSSI via this simple prototype.
+        addClassicPairedDevices()
+
+        // Also try Classic Bluetooth discovery (best effort).
+        // This discovers unpaired devices but does not provide RSSI.
+        startClassicDiscovery()
+
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult?) {
                 result?.let {
@@ -186,9 +203,116 @@ class MainActivity : ComponentActivity() {
         isScanning = true
     }
 
+    // Add already paired Classic Bluetooth devices to the current device list.
+    // Prototype note: BluetoothAdapter.bondedDevices does not provide RSSI.
+    private fun addClassicPairedDevices() {
+        val adapter = bluetoothAdapter ?: return
+        val bondedDevices = adapter.bondedDevices ?: return
+
+        bondedDevices.forEach { device ->
+            val name = device.name ?: "Unknown Device"
+            val address = device.address ?: return@forEach
+
+            val updatedDevice = ScannedDevice(
+                name = name,
+                address = address,
+                rssi = RSSI_NOT_AVAILABLE
+            )
+
+            val existingIndex = scannedDevices.indexOfFirst { it.address == address }
+            if (existingIndex >= 0) {
+                scannedDevices[existingIndex] = updatedDevice
+            } else {
+                scannedDevices.add(updatedDevice)
+            }
+        }
+    }
+
+    // Start Classic Bluetooth discovery (best effort).
+    // RSSI is not available in ACTION_FOUND, so we store RSSI_NOT_AVAILABLE.
+    @SuppressLint("MissingPermission")
+    private fun startClassicDiscovery() {
+        val adapter = bluetoothAdapter ?: return
+
+        ensureClassicReceiverRegistered()
+
+        try {
+            // Avoid "already discovering" issues
+            if (adapter.isDiscovering) {
+                adapter.cancelDiscovery()
+            }
+            adapter.startDiscovery()
+        } catch (_: Exception) {
+            // Prototype: ignore discovery errors
+        }
+    }
+
+    private fun ensureClassicReceiverRegistered() {
+        if (isClassicReceiverRegistered) return
+
+        if (classicFoundReceiver == null) {
+            classicFoundReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    if (intent.action != BluetoothDevice.ACTION_FOUND) return
+
+                    val device: BluetoothDevice? =
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    val address = device?.address ?: return
+                    val name = device.name ?: "Unknown Device"
+
+                    val updatedDevice = ScannedDevice(
+                        name = name,
+                        address = address,
+                        rssi = RSSI_NOT_AVAILABLE
+                    )
+
+                    val existingIndex = scannedDevices.indexOfFirst { it.address == address }
+                    if (existingIndex >= 0) {
+                        scannedDevices[existingIndex] = updatedDevice
+                    } else {
+                        scannedDevices.add(updatedDevice)
+                    }
+                }
+            }
+        }
+
+        try {
+            registerReceiver(
+                classicFoundReceiver,
+                IntentFilter(BluetoothDevice.ACTION_FOUND)
+            )
+            isClassicReceiverRegistered = true
+        } catch (_: Exception) {
+            // Prototype: ignore registration errors
+        }
+    }
+
+    private fun stopClassicDiscovery() {
+        val adapter = bluetoothAdapter
+        try {
+            if (adapter?.isDiscovering == true) {
+                adapter.cancelDiscovery()
+            }
+        } catch (_: Exception) {
+            // ignore
+        }
+
+        if (isClassicReceiverRegistered && classicFoundReceiver != null) {
+            try {
+                unregisterReceiver(classicFoundReceiver)
+            } catch (_: Exception) {
+                // ignore
+            }
+        }
+
+        isClassicReceiverRegistered = false
+    }
+
     // Stop an active BLE scan
     @SuppressLint("MissingPermission")
     private fun stopBleScan() {
+        stopClassicDiscovery()
+
         val scanner = bluetoothLeScanner ?: bluetoothAdapter?.bluetoothLeScanner
         val callback = scanCallback
 
@@ -257,7 +381,12 @@ fun BluetoothSignalMonitorScreen(
         }
     }
 
-    val displayRssi = smoothedRssi?.roundToInt() ?: selectedDevice?.rssi
+    val displayRssi = if (selectedDevice?.let { isRssiAvailable(it.rssi) } == true) {
+        smoothedRssi?.roundToInt() ?: selectedDevice?.rssi
+    } else {
+        null
+    }
+
     val signalQuality = displayRssi?.let { classifySignalQuality(it) } ?: "Unknown"
     val distanceRange = displayRssi?.let { classifyDistanceRange(it) } ?: "Unknown"
     val approxDistanceMeters = averageRssiLast5?.let { estimateDistanceMeters(it) }
@@ -304,15 +433,23 @@ fun BluetoothSignalMonitorScreen(
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
-                        text = "RSSI: ${displayRssi ?: selectedDevice.rssi} dBm",
+                        text = if (displayRssi != null) {
+                            "RSSI: $displayRssi dBm"
+                        } else {
+                            "RSSI not available"
+                        },
                         style = MaterialTheme.typography.bodySmall
                     )
                     Text(
-                        text = "Signal: $signalQuality",
+                        text = if (displayRssi != null) "Signal: $signalQuality" else "Signal: N/A",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Text(
-                        text = "Approx distance: $distanceRange",
+                        text = if (displayRssi != null) {
+                            "Approx distance: $distanceRange"
+                        } else {
+                            "Approx distance: N/A"
+                        },
                         style = MaterialTheme.typography.bodySmall
                     )
                     Text(
@@ -459,25 +596,39 @@ fun BluetoothDeviceCard(
                     style = MaterialTheme.typography.bodyMedium
                 )
                 Text(
-                    text = "RSSI: ${device.rssi} dBm",
+                    text = if (isRssiAvailable(device.rssi)) {
+                        "RSSI: ${device.rssi} dBm"
+                    } else {
+                        "RSSI not available"
+                    },
                     style = MaterialTheme.typography.bodySmall
                 )
             }
 
             Spacer(modifier = Modifier.width(12.dp))
 
-            SignalBars(
-                bars = rssiToBars(device.rssi),
-                modifier = Modifier
-                    .height(24.dp)
-                    .width(34.dp)
-            )
+            if (isRssiAvailable(device.rssi)) {
+                SignalBars(
+                    bars = rssiToBars(device.rssi),
+                    modifier = Modifier
+                        .height(24.dp)
+                        .width(34.dp)
+                )
+            } else {
+                Spacer(
+                    modifier = Modifier
+                        .height(24.dp)
+                        .width(34.dp)
+                )
+            }
         }
     }
 }
 
 // Convert RSSI (dBm) into 1–5 signal bars (simple prototype mapping)
 private fun rssiToBars(rssi: Int): Int {
+    // If RSSI isn't available (Classic devices), treat as minimum.
+    if (!isRssiAvailable(rssi)) return 1
     return when {
         rssi >= -55 -> 5
         rssi >= -60 -> 4
@@ -511,6 +662,10 @@ private fun classifyDistanceRange(rssi: Int): String {
         else -> "Very Far / Unstable"
     }
 }
+
+private const val RSSI_NOT_AVAILABLE: Int = -9999
+
+private fun isRssiAvailable(rssi: Int): Boolean = rssi != RSSI_NOT_AVAILABLE
 
 @Composable
 fun SignalBars(
