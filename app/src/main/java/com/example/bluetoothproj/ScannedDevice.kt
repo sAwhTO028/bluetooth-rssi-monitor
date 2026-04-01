@@ -6,3 +6,7 @@ data class ScannedDevice(
     val rssi: Int
 )
 
+data class RssiRecord(
+    val rssi: Int,
+    val timestamp: Long
+)

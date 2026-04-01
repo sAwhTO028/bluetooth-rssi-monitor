@@ -26,8 +26,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -70,10 +70,9 @@ class MainActivity : ComponentActivity() {
     // Track discovered devices as Compose state so the UI updates automatically
     private val scannedDevices = mutableStateListOf<ScannedDevice>()
 
-    // In-memory RSSI history:
-    // store the latest 100 RSSI values per device (keyed by MAC address)
+    // Store RSSI history with timestamp per device (unlimited history)
     private val rssiHistoryByAddress =
-        mutableStateMapOf<String, SnapshotStateList<Int>>()
+        mutableStateMapOf<String, SnapshotStateList<RssiRecord>>()
 
     // Track whether we are currently scanning
     private var isScanning by mutableStateOf(false)
@@ -172,15 +171,11 @@ class MainActivity : ComponentActivity() {
         if (scanCallback != null) return
 
         // Clear old scan results when starting a new scan
-        // Keep history as-is only if you want to preserve past device logs.
-        // Current behavior: clear visible device list, but keep previous history
-        // until user presses Clear.
         scannedDevices.clear()
 
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult?) {
                 result?.let {
-                    // Update Compose state from the UI thread for safety
                     runOnUiThread { handleScanResult(it) }
                 }
             }
@@ -192,15 +187,7 @@ class MainActivity : ComponentActivity() {
             }
 
             override fun onScanFailed(errorCode: Int) {
-                // For a simple prototype we just stop scanning on error
-                runOnUiThread {
-                    isScanning = false
-                    Toast.makeText(
-                        this@MainActivity,
-                        "BLE scan failed: $errorCode",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
+                runOnUiThread { isScanning = false }
             }
         }
 
@@ -243,38 +230,32 @@ class MainActivity : ComponentActivity() {
             scannedDevices.add(updatedDevice)
         }
 
-        // Update RSSI history for this device.
-        // Keep only the latest 100 values.
+        // Unlimited RSSI history with timestamp
         val history = rssiHistoryByAddress.getOrPut(address) { mutableStateListOf() }
-        history.add(rssi)
-        if (history.size > 100) {
-            history.removeAt(0)
-        }
+        history.add(
+            RssiRecord(
+                rssi = rssi,
+                timestamp = System.currentTimeMillis()
+            )
+        )
     }
 
     private fun exportRssiHistoryToCsv(
         context: Context,
         device: ScannedDevice,
-        history: List<Int>
+        history: List<RssiRecord>
     ) {
-        if (history.size < 100) {
+        if (history.isEmpty()) {
             Toast.makeText(
                 context,
-                "Need at least 100 RSSI values before export.",
+                "No RSSI data to export.",
                 Toast.LENGTH_SHORT
             ).show()
             return
         }
 
-        val latest100 = history.takeLast(100)
-
         val timestampForFile = SimpleDateFormat(
             "yyyyMMdd_HHmmss",
-            Locale.getDefault()
-        ).format(Date())
-
-        val exportTime = SimpleDateFormat(
-            "yyyy-MM-dd HH:mm:ss",
             Locale.getDefault()
         ).format(Date())
 
@@ -290,14 +271,19 @@ class MainActivity : ComponentActivity() {
         val file = File(exportDir, fileName)
 
         val csvContent = buildString {
-            appendLine("device_name,mac_address,export_time,index,rssi")
-            latest100.forEachIndexed { index, rssi ->
+            appendLine("device_name,mac_address,index,rssi,timestamp")
+            history.forEachIndexed { index, record ->
+                val formattedTime = SimpleDateFormat(
+                    "yyyy-MM-dd HH:mm:ss.SSS",
+                    Locale.getDefault()
+                ).format(Date(record.timestamp))
+
                 appendLine(
                     "${escapeCsv(device.name)}," +
                             "${escapeCsv(device.address)}," +
-                            "${escapeCsv(exportTime)}," +
                             "${index + 1}," +
-                            "$rssi"
+                            "${record.rssi}," +
+                            "${escapeCsv(formattedTime)}"
                 )
             }
         }
@@ -329,12 +315,12 @@ class MainActivity : ComponentActivity() {
 fun BluetoothSignalMonitorScreen(
     modifier: Modifier = Modifier,
     devices: List<ScannedDevice> = emptyList(),
-    rssiHistoryByAddress: Map<String, List<Int>> = emptyMap(),
+    rssiHistoryByAddress: Map<String, List<RssiRecord>> = emptyMap(),
     isScanning: Boolean = false,
     onStartScanClick: () -> Unit = {},
     onStopScanClick: () -> Unit = {},
     onClearClick: () -> Unit = {},
-    onExportCsvClick: (ScannedDevice, List<Int>) -> Unit = { _, _ -> }
+    onExportCsvClick: (ScannedDevice, List<RssiRecord>) -> Unit = { _, _ -> }
 ) {
     // Selected device state (prototype-only, no navigation)
     var selectedAddress by remember { mutableStateOf<String?>(null) }
@@ -342,11 +328,16 @@ fun BluetoothSignalMonitorScreen(
     val selectedDevice = devices.firstOrNull { it.address == selectedAddress }
     val fullHistory = selectedAddress?.let { rssiHistoryByAddress[it] } ?: emptyList()
 
-    // Keep 100 internally, but show only the latest 20 in UI
-    val recentRssiForDisplay = fullHistory.takeLast(20)
-    val latest100RssiForExport = fullHistory.takeLast(100)
+    // Show only the latest 20 in the UI
+    val recentRecordsForDisplay = fullHistory.takeLast(20)
+    val recentRssiValues = recentRecordsForDisplay.map { it.rssi }
 
-    val averageRssiLast5 = fullHistory.takeLast(5).average().takeIf { !it.isNaN() }
+    // Use latest 5 RSSI values (from full history) for smoothing
+    val averageRssiLast5 = fullHistory
+        .takeLast(5)
+        .map { it.rssi }
+        .average()
+        .takeIf { !it.isNaN() }
 
     // Smooth displayed RSSI to reduce sudden jumps
     var smoothedRssi by remember(selectedAddress) { mutableStateOf<Double?>(null) }
@@ -425,28 +416,28 @@ fun BluetoothSignalMonitorScreen(
                     Spacer(modifier = Modifier.height(4.dp))
 
                     Text(
-                        text = "Recent RSSI (showing last 20 / storing up to 100):",
+                        text = "Recent RSSI (showing last 20 / storing all):",
                         style = MaterialTheme.typography.bodySmall,
                         fontWeight = FontWeight.SemiBold
                     )
 
-                    if (recentRssiForDisplay.isEmpty()) {
+                    if (recentRssiValues.isEmpty()) {
                         Text(
                             text = "No history yet.",
                             style = MaterialTheme.typography.bodySmall
                         )
                     } else {
-                        // Newest values first
                         RssiHistoryChipGrid(
-                            values = recentRssiForDisplay.asReversed()
+                            values = recentRssiValues.asReversed()
                         )
                     }
 
-                    if (latest100RssiForExport.size >= 100) {
+                    // Show Export CSV when there is at least 1 record
+                    if (fullHistory.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(8.dp))
                         Button(
                             onClick = {
-                                onExportCsvClick(selectedDevice, latest100RssiForExport)
+                                onExportCsvClick(selectedDevice, fullHistory)
                             },
                             modifier = Modifier.fillMaxWidth()
                         ) {
@@ -602,7 +593,6 @@ private fun rssiToBars(rssi: Int): Int {
     }
 }
 
-// Estimate distance in meters from averaged RSSI
 private fun estimateDistanceMeters(rssi: Double, txPower: Int = -59): Double {
     return 10.0.pow((txPower - rssi) / 20.0)
 }
@@ -640,7 +630,6 @@ fun SignalBars(
         modifier = modifier,
         horizontalArrangement = Arrangement.spacedBy(3.dp)
     ) {
-        // Draw 5 vertical bars with increasing heights (no custom canvas)
         for (i in 1..5) {
             val height = (8 + i * 3).dp
             val color = if (i <= clampedBars) activeColor else inactiveColor
